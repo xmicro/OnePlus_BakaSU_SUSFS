@@ -2254,6 +2254,22 @@ runs:
         CONFIG_STRING="${OPTIONS[*]}"
         echo "CONFIG_FAKE_DISABLE=${CONFIG_STRING}" >> $GITHUB_ENV
 
+    - name: Fix legacy libbpf const correctness
+      shell: bash
+      run: |
+        set -euo pipefail
+        patch_file="$GITHUB_ACTION_PATH/../../patches/build-tools/libbpf-const-correctness.patch"
+
+        # Only change sources where both const-correctness fixes match exactly.
+        if git -C "$COMMON_KERNEL_FOLDER" apply --reverse --check "$patch_file"; then
+          echo "libbpf const-correctness fix is already present."
+        elif git -C "$COMMON_KERNEL_FOLDER" apply --check "$patch_file"; then
+          git -C "$COMMON_KERNEL_FOLDER" apply "$patch_file"
+          echo "Applied libbpf const-correctness fix."
+        else
+          echo "This libbpf source differs; leaving it unchanged."
+        fi
+
     - name: Build Kernel
       id: build_kernel_step
       shell: bash
