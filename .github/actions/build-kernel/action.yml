@@ -779,26 +779,39 @@ runs:
               aria_log_flags="--summary-interval=5" # Show progress every 5s in debug
           fi
           
-          local aria2_headers=(
-            "--header=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            "--header=Accept: */*"
-            "--header=Connection: keep-alive"
+          local user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          local aria2_args=(
+            --user-agent="$user_agent"
+            --header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/octet-stream,*/*;q=0.8"
+            --header "Accept-Language: en-US,en;q=0.9"
+            --header "Sec-Fetch-Dest: document"
+            --header "Sec-Fetch-Mode: navigate"
+            --header "Sec-Fetch-Site: none"
+            --header "Sec-Fetch-User: ?1"
+            --header "Upgrade-Insecure-Requests: 1"
           )
           
           local download_url=""
           if [[ "$url" == *"github.com"* ]]; then
               download_url="${url%.git}/archive/refs/heads/${branch}.tar.gz"
           elif [[ "$url" == *"gitlab.com"* ]]; then
-              download_url="${url%.git}/-/archive/${branch}/${repo_name}-${branch}.tar.gz"
+              local project_path=$(echo "$url" | sed -E 's#^https?://gitlab\.com/##; s#\.git$##; s#/#%2F#g')
+              download_url="https://gitlab.com/api/v4/projects/${project_path}/repository/archive.tar.gz?sha=${branch}"
           else
               echo "::error::Unsupported host: $url"
               return 1
           fi
           
           while [ $attempt -le $max_attempts ]; do
+              local conn=1
+              case $attempt in
+                1) conn=16 ;;
+                2) conn=4 ;;
+                *) conn=1 ;;
+              esac
               echo " Attempt $attempt/$max_attempts: High-speed fetch for $repo_name ($branch)"
               
-              if aria2c -x16 -s16 -j16 -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
+              if aria2c -x"$conn" -s"$conn" -j16 -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_args[@]}" $aria_log_flags "$download_url"; then
                   mkdir -p "$repo_name"
                   if tar -I "pigz -p $nproc -b 256" -x --record-size=1M -f "$shm_path" -C "$repo_name" --strip-components=1 --no-same-owner; then
                       echo "✅ Success: $repo_name synced"
@@ -1162,6 +1175,93 @@ runs:
             if ! grep -qxF '#include <linux/susfs_def.h>' fs/proc/task_mmu.c; then
               sed -i '/#include <linux\/pkeys.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif // #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)' fs/proc/task_mmu.c
             fi
+            rm fs/proc/task_mmu.c.rej
+          fi
+
+          # OnePlus 6.12 trees use the older smaps-rollup loop and omit the
+          # dma-buf include used as context by the generic Android 16 patch.
+          if [ -f fs/exec.c.rej ] && \
+             [ "$(grep -c '^@@ ' fs/exec.c.rej)" -eq 1 ] && \
+             grep -q 'linux/susfs_def.h' fs/exec.c.rej && \
+             grep -q 'linux/dma-buf.h' fs/exec.c.rej; then
+            echo "Manually injecting the SUSFS header into fs/exec.c..."
+            python3 - fs/exec.c <<'PY'
+        import sys
+        from pathlib import Path
+
+        path = Path(sys.argv[1])
+        text = path.read_text()
+        include = "#include <linux/susfs_def.h>"
+        if include not in text:
+            anchor = "#include <linux/ksm.h>\n"
+            if text.count(anchor) != 1:
+                raise SystemExit("unexpected fs/exec.c include layout")
+            text = text.replace(
+                anchor,
+                anchor + "#ifdef CONFIG_KSU_SUSFS\n" + include + "\n#endif\n",
+                1,
+            )
+            path.write_text(text)
+        PY
+            rm fs/exec.c.rej
+          fi
+
+          if [ -f fs/proc/task_mmu.c.rej ] && \
+             [ "$(grep -c '^@@ ' fs/proc/task_mmu.c.rej)" -eq 3 ] && \
+             grep -q 'static int show_smap' fs/proc/task_mmu.c.rej && \
+             grep -q 'bypass_orig_flow' fs/proc/task_mmu.c.rej; then
+            echo "Adapting SUSFS map filtering to the legacy 6.12 smaps-rollup loop..."
+            python3 - fs/proc/task_mmu.c <<'PY'
+        import re
+        import sys
+        from pathlib import Path
+
+        path = Path(sys.argv[1])
+        text = path.read_text()
+
+        show_smap_start = text.index("static int show_smap(")
+        rollup_start = text.index("static int show_smaps_rollup(", show_smap_start)
+        show_smap = text[show_smap_start:rollup_start]
+        if "SUSFS_IS_INODE_SUS_MAP" not in show_smap:
+            marker = "\tstruct mem_size_stats mss = {};\n\n"
+            if show_smap.count(marker) != 1:
+                raise SystemExit("unexpected show_smap layout")
+            guard = (
+                "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+                "\tif (vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
+                "\t\treturn 0;\n"
+                "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n"
+            )
+            show_smap = show_smap.replace(marker, marker + guard, 1)
+
+        rollup_end = text.index("#undef SEQ_PUT_DEC", rollup_start)
+        rollup = text[rollup_start:rollup_end]
+        gather_pattern = re.compile(
+            r"(?m)^(?P<indent>\t+)smap_gather_stats\(vma, &mss, "
+            r"(?P<offset>0|last_vma_end)\);$"
+        )
+
+        def guard_gather(match):
+            indent = match.group("indent")
+            call = f"smap_gather_stats(vma, &mss, {match.group('offset')});"
+            return (
+                "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+                f"{indent}if (!vma->vm_file || "
+                "!SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
+                f"{indent}\t{call}\n"
+                "#else\n"
+                f"{indent}{call}\n"
+                "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP"
+            )
+
+        rollup, replacements = gather_pattern.subn(guard_gather, rollup)
+        if replacements != 3:
+            raise SystemExit(f"expected 3 legacy smaps gather calls, found {replacements}")
+
+        path.write_text(
+            text[:show_smap_start] + show_smap + rollup + text[rollup_end:]
+        )
+        PY
             rm fs/proc/task_mmu.c.rej
           fi
 
@@ -2285,10 +2385,11 @@ runs:
         # The N6X vendor defconfig builds OPLUS_NFC together with the external
         # OPLUS_FEATURE_OPROJECT module. A GKI-only build has no project module,
         # so the driver's default-y setting otherwise leaves unresolved symbols.
-        if [ "$OP_MODEL" = "OP-N6X-5.15.197" ]; then
-          scripts/config --file "$OUT/.config" -d OPLUS_NFC
-        fi
-        
+        case "$OP_MODEL" in
+          OP-N6X|OP-N6X-*)
+            scripts/config --file "$OUT/.config" -d OPLUS_NFC
+            ;;
+        esac
         
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" olddefconfig
         
